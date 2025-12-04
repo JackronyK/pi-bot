@@ -1,0 +1,9 @@
+{
+  "raw_question": "Solve for x: 2*x + 3 = 11",
+  "equations": [
+    ["2*x + 3", "11"]
+  ],
+  "unknowns": ["x"],
+  "goal": "solve",
+  "notes": "heuristic-fallback"
+}

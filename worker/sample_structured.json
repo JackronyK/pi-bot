@@ -1,9 +1,26 @@
 {
-  "raw_question": "Solve for x: 2*x + 3 = 11",
+  "problem_type": "Probability (Normal Distribution)",
+  "raw_question": "The average number of acres burned by forest and range fires in a large New Mexico county is 4,300 acres per year, with a standard deviation of 750 acres. The distribution of the number of acres burned is normal. What is the probability that between 2,500 and 4,200 acres will be burned in any given year?",
+  "goal": "Calculate the probability that the number of acres burned is between 2,500 and 4,200.",
   "equations": [
-    ["2*x + 3", "11"]
+    {
+      "lhs": "mean (μ)",
+      "rhs": "4300 acres"
+    },
+    {
+      "lhs": "standard deviation (σ)",
+      "rhs": "750 acres"
+    },
+    {
+      "lhs": "lower bound for X",
+      "rhs": "2500 acres"
+    },
+    {
+      "lhs": "upper bound for X",
+      "rhs": "4200 acres"
+    }
   ],
-  "unknowns": ["x"],
-  "goal": "solve",
-  "notes": "heuristic-fallback"
+  "unknowns": [
+    "P(2500 < X < 4200)"
+  ]
 }

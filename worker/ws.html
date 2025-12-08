@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Sum of the Infinite Geometric Series</title>
+</head>
+<body>
+  <p>Let's evaluate the given series step-by-step:</p>
+
+  <h3>Step 1: Identify the type of series</h3>
+  <p>The given series is: <code>1 + 1/7 + 1/49 + 1/343 + ...</code></p>
+  <p>Let's look at the relationship between consecutive terms:</p>
+  <ul>
+    <li>From the 1st term (<code>1</code>) to the 2nd term (<code>1/7</code>), we multiply by <code>1/7</code>.</li>
+    <li>From the 2nd term (<code>1/7</code>) to the 3rd term (<code>1/49</code>), we multiply by <code>1/7</code> (since <code>(1/7) * (1/7) = 1/49</code>).</li>
+    <li>From the 3rd term (<code>1/49</code>) to the 4th term (<code>1/343</code>), we multiply by <code>1/7</code> (since <code>(1/49) * (1/7) = 1/343</code>).</li>
+  </ul>
+  <p>Since each term is obtained by multiplying the previous term by a constant value, this is an <b>infinite geometric series</b>.</p>
+
+  <h3>Step 2: Determine the first term (a) and common ratio (r)</h3>
+  <p>In a geometric series:</p>
+  <ul>
+    <li>The <b>first term (a)</b> is the first number in the series. Here, <code>a = 1</code>.</li>
+    <li>The <b>common ratio (r)</b> is the constant value by which each term is multiplied to get the next term. Here, <code>r = 1/7</code>.</li>
+  </ul>
+
+  <h3>Step 3: Check the condition for the sum of an infinite geometric series</h3>
+  <p>An infinite geometric series has a finite sum only if the absolute value of the common ratio (<code>|r|</code>) is less than 1 (<code>|r| < 1</code>).</p>
+  <p>In our case, <code>r = 1/7</code>. So, <code>|1/7| = 1/7</code>.</p>
+  <p>Since <code>1/7 < 1</code>, the condition is met, and we can find the sum of this series.</p>
+
+  <h3>Step 4: Apply the formula for the sum of an infinite geometric series</h3>
+  <p>The formula for the sum (<code>S</code>) of an infinite geometric series is:</p>
+  <p><code>S = a / (1 - r)</code></p>
+
+  <h3>Step 5: Substitute the values and calculate the sum</h3>
+  <p>Substitute <code>a = 1</code> and <code>r = 1/7</code> into the formula:</p>
+  <p><code>S = 1 / (1 - 1/7)</code></p>
+  <p>First, calculate the denominator:</p>
+  <p><code>1 - 1/7 = 7/7 - 1/7 = 6/7</code></p>
+  <p>Now, substitute this back into the formula for S:</p>
+  <p><code>S = 1 / (6/7)</code></p>
+  <p>Dividing by a fraction is the same as multiplying by its reciprocal:</p>
+  <p><code>S = 1 * (7/6)</code></p>
+  <p><code>S = 7/6</code></p>
+  <p>As a decimal, <code>7/6</code> is approximately <code>1.166666...</code></p>
+
+  <h3>Conclusion:</h3>
+  <p>The sum of the infinite geometric series <code>1 + 1/7 + 1/49 + 1/343 + ...</code> is <code>7/6</code>.</p>
+</body>
+</html>

@@ -1,23 +1,16 @@
+# executor/Dockerfile
 FROM python:3.12-slim
 
-# install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    poppler-utils \
-    build-essential \
-    libgl1 \
-    libpng-dev \
-    libjpeg-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /usr/src/executor
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy executor runner script
-COPY run_executor.py .
+# copy runtime requirements and install
+COPY requirements.txt /usr/src/executor/requirements.txt
+RUN pip install --no-cache-dir -r /usr/src/executor/requirements.txt
 
-#Default command
-CMD [ "python", "run_executor.py" ]
+# copy entrypoint and make executable
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Entrypoint: will run /job/job.py (mounted by orchestrator) by default
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# no CMD so user may override with docker run ... <cmd>

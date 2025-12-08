@@ -311,3 +311,60 @@ def local_sympy_solve_from_question(question: str) -> Dict[str, Any]:
         "validation": {"ok": bool(valid), "method": "substitution"},
     }
     return result
+
+# ---------------------------
+# Helpers: unwrap & tolerant JSON extraction
+# ---------------------------
+def unwrap_markdown_code(s: str) -> str:
+    """
+    Remove triple-backtick fences and surrounding commentary from model outputs.
+    If no fences, returns original stripped string.
+    """
+    if not s:
+        return ""
+    s.strip()
+    # common fenced block pattern 
+    m = re.search(r"```(?:python|py)?\n(.+?)\n```", s, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # also strip single-line fenced content ```...```
+    m2 = re.search(r"```(.+?)```", s, flags=re.DOTALL)
+    if m2:
+        return m2.group(1).strip()
+    # remove leading ```python or ```json markers, trailing ```
+    s = re.sub(r"^```(?:python|py|json)?\n?", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\n?```$", "", s, flags=re.IGNORECASE).strip()
+    return s
+
+def extract_json_from_text_tolerant(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to extract JSON/dict from arbitrary text produced by model or executor.
+    Returns parsed dict or None.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    # If text looks like a fenced block, unwrap first
+    t_unwrapped = _unwrap_markdown_code(t)
+    # try direct parse
+    try:
+        return json.loads(t_unwrapped)
+    except Exception:
+        pass
+    # fallback: find first {...} block
+    m = re.search(r"(\{.*\})", t, flags=re.DOTALL)
+    if not m:
+        return None
+    candidate = m.group(1)
+    # progressively try to trim trailing garbage to find valid JSON
+    for end in range(len(candidate), 0, -1):
+        try:
+            return json.loads(candidate[:end])
+        except Exception:
+            continue
+    # last attempt: try to eval as python literal safely (not recommended),
+    # we avoid eval to be safe — return None
+    return None
+
+    
+

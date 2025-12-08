@@ -2,3 +2,6 @@ requests
 python-dotenv
 redis
 rq
+sympy
+google-genai
+docker

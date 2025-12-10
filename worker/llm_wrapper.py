@@ -25,7 +25,7 @@ import logging
 from typing import Any, Dict, Optional
 
 # local helpers (heuristics / sympy stub)
-import utils
+from worker import utils
 
 # genai client
 from google import genai

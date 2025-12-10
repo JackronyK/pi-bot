@@ -8,3 +8,20 @@ boto3
 requests
 pytest
 python-dotenv
+sympy
+google
+
+
+# OCR / PDF / imaging
+pdf2image==1.16.0        # uses poppler pdftoppm (installed as poppler-utils)
+PyMuPDF==1.24.0          # fitz (alternative PDF parser)
+opencv-python-headless==4.8.0.76
+pytesseract==0.3.10
+Pillow==10.0.0
+python-magic==0.4.27     # optional: file type detection
+
+# utilities
+python-multipart==0.0.6  # for FastAPI multipart handling if using it in API
+minio==7.1.11            # if you use MinIO from worker to upload previews
+
+

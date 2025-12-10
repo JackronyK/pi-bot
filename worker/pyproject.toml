@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pibot-worker"
+version = "0.0.1"
+description = "PIBOT worker package"
+readme = "README.md"
+authors = [
+  { name = "You", email = "you@example.com" }
+]
+license = { text = "MIT" }
+dependencies = []
+# optional classifiers, etc.

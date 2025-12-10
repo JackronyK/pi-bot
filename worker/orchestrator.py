@@ -24,7 +24,7 @@ import re
 from typing import Any, Dict
 
 import redis
-import utils, safety
+from worker import utils, safety
 
 logger = logging.getLogger("orchestrator")
 logger.setLevel(os.environ.get("PIBOT_LOG_LEVEL", "INFO"))
@@ -46,7 +46,7 @@ DOCKER_CPUS = os.environ.get("PIBOT_DOCKER_CPUS", "0.5")
 PIBOT_USE_LLM = os.environ.get("PIBOT_USE_LLM", "false").lower() in ("1", "true", "yes")
 if PIBOT_USE_LLM:
     try:
-        import llm_wrapper
+        from worker import llm_wrapper
     except Exception:
         logger.exception("Failed to import llm_wrapper")
         llm_wrapper = None

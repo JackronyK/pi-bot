@@ -236,7 +236,7 @@ def format_steps(eq_objs: List[Eq], solutions: Any, unknown_syms: List[str]) -> 
 # ---------------------------
 # Orchestration / metadata helpers
 # ---------------------------
-def _normalize_requested_solver_from_job(job: Dict[str, Any]) -> str:
+def normalize_requested_solver_from_job(job: Dict[str, Any]) -> str:
     """
     Return normalized requested solver label for the job (for observability).
     """

@@ -4,8 +4,8 @@ python-dotenv
 redis
 rq
 sympy
-google-genai
 docker
+google-genai
 streamlit
 
 # OCR / PDF / imaging

@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional
 from worker import utils
 
 # genai client
-from google import genai
+import google.genai as genai
 
 logger = logging.getLogger("worker.llm_wrapper")
 logger.setLevel(os.environ.get("PIBOT_LOG_LEVEL", "INFO"))

@@ -9,8 +9,7 @@ requests
 pytest
 python-dotenv
 sympy
-google
-
+google-genai
 
 # OCR / PDF / imaging
 pdf2image==1.16.0        # uses poppler pdftoppm (installed as poppler-utils)

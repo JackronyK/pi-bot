@@ -345,7 +345,7 @@ def extract_json_from_text_tolerant(text: str) -> Optional[Dict[str, Any]]:
         return None
     t = text.strip()
     # If text looks like a fenced block, unwrap first
-    t_unwrapped = _unwrap_markdown_code(t)
+    t_unwrapped = unwrap_markdown_code(t)
     # try direct parse
     try:
         return json.loads(t_unwrapped)

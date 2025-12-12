@@ -1,20 +1,39 @@
 # worker/llm_wrapper.py
 """
-LLM wrapper using Google Gemini (genai). Supports separate models for:
- - parser
- - codegen
- - explainer
+LLM Wrapper - Production-Ready Version
+=======================================
+Provides AI-powered mathematical problem-solving capabilities using Google Gemini.
 
-Environment variables (defaults shown):
-PIBOT_GEMINI_PARSER_MODEL=gemini-2.5-flash
-PIBOT_GEMINI_CODEGEN_MODEL=gemini-2.5-pro
-PIBOT_GEMINI_EXPLAIN_MODEL=gemini-2.5-pro
+Core Functions:
+- Question Parsing: Natural language → Structured JSON
+- Code Generation: Structured data → Executable Python
+- Solution Explanation: Results → Human-readable HTML
+
+Features:
+- Multi-strategy JSON extraction
+- Robust error handling with fallbacks
+- Automatic markdown fence removal
+- Safety validation for generated code
+- Retry logic with exponential backoff
+- Comprehensive logging and telemetry
+
+Environment Variables:
+---------------------
+GEMINI_API_KEY=*****        
+
+PIBOT_USE_LLM=true|false
+PIBOT_LLM_PROVIDER=gemini|mock
+
+PIBOT_GEMINI_PARSER_MODEL=gemini-2.0-flash-exp
+PIBOT_GEMINI_CODEGEN_MODEL=gemini-2.0-flash-exp  
+PIBOT_GEMINI_EXPLAIN_MODEL=gemini-2.0-flash-exp
 
 PIBOT_GEMINI_PARSER_TEMP=0.0
 PIBOT_GEMINI_CODEGEN_TEMP=0.0
 PIBOT_GEMINI_EXPLAIN_TEMP=0.2
 
-GEMINI_API_KEY must be set in environment for genai.Client() to work.
+PIBOT_MAX_RETRIES=2
+PIBOT_RETRY_DELAY=1.0
 """
 from __future__ import annotations
 
@@ -22,29 +41,42 @@ import os
 import json
 import re
 import logging
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict, Optional,Tuple, List
 
-# local helpers (heuristics / sympy stub)
+# local helpers
 from worker import utils
 
 # genai client
-import google.genai as genai
+try:
+    import google.genai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    GENAI_AVAILABLE = False
 
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
 logger = logging.getLogger("worker.llm_wrapper")
 logger.setLevel(os.environ.get("PIBOT_LOG_LEVEL", "INFO"))
 if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(h)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s [%(funcName)s] - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
-# --------------------
-# Configuration
-# --------------------
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 PIBOT_USE_LLM = os.environ.get("PIBOT_USE_LLM", "false").lower() in ("1", "true", "yes")
 PIBOT_LLM_PROVIDER = os.environ.get("PIBOT_LLM_PROVIDER", "gemini").lower()  # 'gemini' or 'mock'
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 
-# Gemini / provider settings (optional)
+# Model Selection
 PARSER_MODEL = os.environ.get("PIBOT_GEMINI_PARSER_MODEL", "gemini-2.5-flash")
 CODEGEN_MODEL = os.environ.get("PIBOT_GEMINI_CODEGEN_MODEL", "gemini-2.5-pro")
 EXPLAIN_MODEL = os.environ.get("PIBOT_GEMINI_EXPLAIN_MODEL", "gemini-2.5-pro")
@@ -54,27 +86,59 @@ PARSER_TEMP = float(os.environ.get("PIBOT_GEMINI_PARSER_TEMP", "0.0"))
 CODEGEN_TEMP = float(os.environ.get("PIBOT_GEMINI_CODEGEN_TEMP", "0.0"))
 EXPLAIN_TEMP = float(os.environ.get("PIBOT_GEMINI_EXPLAIN_TEMP", "0.2"))
 
-# quick forbidden imports for fast pre-check (additional static scan should run later)
-_FORBIDDEN_IMPORT_RE = re.compile(r"\b(import|from)\s+(os|sys|subprocess|socket|shutil|ctypes|multiprocessing|threading|requests)\b", flags=re.IGNORECASE)
+# Retry configuration
+MAX_RETRIES = int(os.environ.get("PIBOT_MAX_RETRIES", "2"))
+RETRY_DELAY = float(os.environ.get("PIBOT_RETRY_DELAY", "1.0"))
 
-# -------------------------
-# Client init
-# -------------------------
-# genai client will pick API key from env variable (GEMINI_API_KEY) as library expects
-try:
-    client = genai.Client()
-except Exception:
-    client = None
-    logger.debug("genai.Client() init failed or not available in this environment - LLM calls will error if attempted")
+FORBIDDEN_IMPORTS = re.compile(
+    r"\b(import|from)\s+(os|sys|subprocess|socket|shutil|ctypes|"
+    r"multiprocessing|threading|requests|urllib|http|pickle|"
+    r"eval|exec|compile|__import__)\b",
+    flags=re.IGNORECASE
+)
 
-# --------------------
-# Helpers
-# --------------------
+# ============================================================================
+# CLIENT INITIALIZATION
+# ============================================================================
+client: Optional[genai.Client] = None
+
+if GENAI_AVAILABLE and PIBOT_USE_LLM and PIBOT_LLM_PROVIDER == "gemini":
+    try:
+        client = genai.Client()
+        logger.info("✓ Gemini client initialized successfully")
+        logger.info(f"  Parser: {PARSER_MODEL}")
+        logger.info(f"  Codegen: {CODEGEN_MODEL}")
+        logger.info(f"  Explainer: {EXPLAIN_MODEL}")
+    except Exception:
+        logger.error(f"Failed to initialize Gemini client: {e}")
+        logger.warning("→ LLM features will use fallback methods")
+        client = None
+else:
+    if not GENAI_AVAILABLE and PIBOT_USE_LLM:
+        logger.warning("google-genai not installed. Install: pip install google-genai")
+    if not PIBOT_USE_LLM:
+        logger.info("LLM features disabled by configuration")
+    client = None 
+
+# ============================================================================
+# PROMPT MANAGEMENT
+# ============================================================================
 def _read_prompt(name: str) -> str:
+    """
+    Load prompt template from prompts directory.
+    
+    Args:
+        name: Prompt filename (e.g., "parser.md")
+    
+    Returns:
+        Prompt content or empty string if not found
+    """
     path = os.path.join(PROMPT_DIR, name)
     try:
         with open(path, "r", encoding="utf8") as f:
-            return f.read()
+            content = f.read()
+            logger.debug(f"Loaded prompt: {name} ({len(content)} chars)")
+            return content
     except FileNotFoundError:
         logger.debug("Prompt file not found: %s", path)
         return ""
@@ -82,367 +146,821 @@ def _read_prompt(name: str) -> str:
         logger.exception("Error reading prompt file %s: %s", path, e)
         return ""
 
-def _call_gemini(prompt: str, model: str, temperature: float) -> str:
+
+# ============================================================================
+# GEMINI API WRAPPER
+# ============================================================================
+def _call_gemini(prompt: str, model: str, temperature: float, max_retries: int = MAX_RETRIES) -> str:
     """
-    Call Gemini via genai client and return text output (best-effort).
-    Attempts to pass temperature; if genai wrapper doesn't support the kw, falls back.
+    Call Gemini API with retry logic and comprehensive error handling.
+    
+    Features:
+    - Exponential backoff on transient failures
+    - Multiple response format support
+    - Detailed logging
+    
+    Args:
+        prompt: Input prompt text
+        model: Gemini model identifier
+        temperature: Sampling temperature (0.0 = deterministic)
+        max_retries: Maximum retry attempts
+    
+    Returns:
+        Generated text response
+    
+    Raises:
+        RuntimeError: If client unavailable or all retries exhausted
     """
     if client is None:
-        raise RuntimeError("genai client not initialized; set GEMINI_API_KEY and install google-genai library")
+        raise RuntimeError(
+            "Gemini client not initialized. "
+            "Set GEMINI_API_KEY environment variable and ensure google-genai is installed."
+        )
+    
+    logger.debug(
+        f"Calling Gemini: model={model}, temp={temperature}, "
+        f"prompt_len={len(prompt)}, retries={max_retries}"
+    )
 
-    logger.debug("Calling gemini model=%s temp=%s len_prompt=%d", model, temperature, len(prompt or ""))
-    try:
-        # try calling with temperature; genai wrappers differ, so handle both styles
+    last_error = None
+
+    for attempt in range(max_retries + 1):
         try:
-            response = client.models.generate_content(model=model, contents=prompt,) #temperature=temperature)
-        except TypeError:
-            # some versions accept generation_config
-            response = client.models.generate_content(model=model, contents=prompt)  # fallback
-        # prefer .text if available
-        text = getattr(response, "text", None)
-        if text:
-            return text
-        # some wrappers put output in response.generations / response.output etc.
-        # attempt some common access patterns:
-        if hasattr(response, "generations"):
-            try:
-                gens = response.generations
-                if isinstance(gens, (list, tuple)) and len(gens) > 0:
-                    # try to get text from first generation
-                    g0 = gens[0]
-                    if isinstance(g0, dict) and "text" in g0:
-                        return g0["text"]
-                    elif hasattr(g0, "text"):
-                        return g0.text
-            except Exception:
-                pass
-        # fallback to stringified response
-        resp_str = str(response)
-        logger.debug("genai response (fallback str): %s", resp_str[:1000])
-        return resp_str
-    except Exception as e:
-        logger.exception("Gemini call failed: %s", e)
-        raise
+            start_time = time.time()
+            
+            # Make API call
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt
+            )
+            
+            duration = time.time() - start_time
 
+            # Extract text from response (handle multiple formats)
+            if hasattr(response, "text") and response.text:
+                result = response.text
+                logger.debug(
+                    f"✓ Gemini response received: {len(result)} chars "
+                    f"in {duration:.2f}s"
+                )                
+                return result
+            # Handle candidates structure
+            if hasattr(response, "candidates") and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, "content"):
+                    content = candidate.content
+                    if hasattr(content, "parts") and content.parts:
+                        text_parts = [
+                            part.text for part in content.parts
+                            if hasattr(part, "text") and part.text
+                        ]
+                        if text_parts:
+                            result = "".join(text_parts)
+                            logger.debug(
+                                f"✓ Extracted from parts: {len(result)} chars "
+                                f"in {duration:.2f}s"
+                            )
+                            return result
+            # Fallback to string representation
+            result = str(response)
+            logger.warning(
+                f"Using fallback string representation: {result[:100]}..."
+            )
+            return result
+        except Exception as e:
+            last_error = e
+            
+            if attempt < max_retries:
+                wait_time = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                logger.warning(
+                    f"Gemini call failed (attempt {attempt + 1}/{max_retries + 1}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                logger.info(f"Retrying in {wait_time:.1f}s...")
+                time.sleep(wait_time)
+            else:
+                logger.error(
+                    f"Gemini call failed after {max_retries + 1} attempts: "
+                    f"{type(e).__name__}: {e}"
+                )
+    
+    raise RuntimeError(f"Gemini API call failed: {last_error}")
+
+
+# ============================================================================
+# JSON EXTRACTION UTILITIES
+# ============================================================================
 def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
-    Try to find a JSON object inside model text. Returns dict or None.
-    This is tolerant: strips surrounding backticks, finds first {...} block.
+    Extract JSON from text using multiple strategies.
+    
+    Strategies (in order):
+    1. Direct JSON parsing
+    2. Remove markdown fences and parse
+    3. Find first complete JSON object via brace matching
+    4. Fix common issues (trailing commas, comments)
+    5. Progressive truncation
+    
+    Args:
+        text: Text potentially containing JSON
+    
+    Returns:
+        Parsed dictionary or None
     """
-    if not text:
+    if not text or not isinstance(text, str):
         return None
-    # remove code fences if present
-    t = re.sub(r"```(?:json|js)?\n", "", text, flags=re.IGNORECASE)
-    t = t.strip(" `\n")
-    # direct load attempt
+    
+    # Strategy 1: Remove markdown fences
+    cleaned = re.sub(r"```(?:json|js|javascript)?\s*\n?", "", text, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" `\n\r\t")
+    
+    # Strategy 2: Direct parse
     try:
-        return json.loads(t)
-    except Exception:
-        # try to find the first {...} substring (balanced brace heuristic)
-        m = re.search(r"\{", t)
-        if not m:
-            return None
-        start = m.start()
-        # naive balancing to find matching closing brace
-        depth = 0
-        end = None
-        for i in range(start, len(t)):
-            if t[i] == "{":
-                depth += 1
-            elif t[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if not end:
-            return None
-        candidate = t[start:end]
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 3: Find first complete JSON object
+    match = re.search(r"\{", cleaned)
+    if not match:
+        return None
+    
+    start_idx = match.start()
+    depth = 0
+    end_idx = None
+    in_string = False
+    escape_next = False
+    
+    for i in range(start_idx, len(cleaned)):
+        char = cleaned[i]
+        
+        if escape_next:
+            escape_next = False
+            continue
+        
+        if char == "\\":
+            escape_next = True
+            continue
+        
+        if char == '"':
+            in_string = not in_string
+            continue
+        
+        if in_string:
+            continue
+        
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = i + 1
+                break
+    
+    if end_idx is None:
+        return None
+    
+    json_candidate = cleaned[start_idx:end_idx]
+    
+    # Strategy 4: Try parsing
+    try:
+        return json.loads(json_candidate)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 5: Fix common issues
+    fixed = json_candidate
+    # Remove trailing commas
+    fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
+    # Remove single-line comments
+    fixed = re.sub(r'//[^\n]*\n', '\n', fixed)
+    # Remove multi-line comments
+    fixed = re.sub(r'/\*.*?\*/', '', fixed, flags=re.DOTALL)
+    
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 6: Progressive truncation (last resort)
+    for end in range(len(json_candidate), start_idx, -10):
         try:
-            return json.loads(candidate)
-        except Exception:
-            # last resort: try to progressively trim trailing chars
-            for eidx in range(len(candidate), start, -1):
-                try:
-                    return json.loads(candidate[:eidx])
-                except Exception:
-                    continue
+            return json.loads(json_candidate[:end])
+        except json.JSONDecodeError:
+            continue
+    
+    logger.warning(f"Failed to extract JSON from text ({len(text)} chars)")
     return None
 
-def unwrap_markdown_code(s: str) -> str:
-    """
-    Remove markdown fences and any leading/trailing explanatory lines.
-    Returns cleaned code string.
-    """
-    if not s:
-        return ""
-    s = s.strip()
-    # fenced triple backticks with optional language spec
-    m = re.search(r"```(?:python|py)?\n(.+?)\n```", s, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # inline fenced block
-    one = re.search(r"```(.+?)```", s, flags=re.DOTALL)
-    if one:
-        return one.group(1).strip()
-    # if the model returned code surrounded by ``` on separate lines at ends
-    s = re.sub(r"^```(?:python|py)?\n", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\n```$", "", s, flags=re.IGNORECASE)
-    return s.strip()
 
-# -------------------------
-# Public API: parser / codegen / explain
-# -------------------------
+# ============================================================================
+# CODE UTILITIES
+# ============================================================================
+def unwrap_markdown_code(text: str) -> str:
+    """
+    Remove markdown code fences from text.
+    
+    Handles:
+    - Triple backtick fences with optional language
+    - Inline code fences
+    - Leading/trailing commentary
+    
+    Args:
+        text: Text potentially containing fenced code
+    
+    Returns:
+        Clean code string
+    """
+    if not text:
+        return ""
+    
+    text = text.strip()
+    
+    # Match fenced code block with language specifier
+    match = re.search(
+        r"```(?:python|py|code)?\s*\n(.+?)\n```",
+        text,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+    if match:
+        return match.group(1).strip()
+    
+    # Match inline code fence
+    match = re.search(r"```(.+?)```", text, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    # Remove standalone fence markers
+    text = re.sub(r"^```(?:python|py|code)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text, flags=re.IGNORECASE)
+    
+    return text.strip()
+
+
+def check_code_safety_basic(code: str) -> Tuple[bool, List[str]]:
+    """
+    Perform basic safety pre-check on generated code.
+    
+    Note: This is a lightweight check. Full safety scanning
+    happens later via the safety module.
+    
+    Args:
+        code: Python code to check
+    
+    Returns:
+        Tuple of (is_safe, list_of_issues)
+    """
+    issues = []
+    
+    if not code or not code.strip():
+        issues.append("Code is empty")
+        return False, issues
+    
+    # Check for forbidden imports
+    forbidden_matches = FORBIDDEN_IMPORTS.findall(code)
+    if forbidden_matches:
+        unique_imports = set(match[1] for match in forbidden_matches)
+        issues.append(f"Forbidden imports: {', '.join(unique_imports)}")
+    
+    # Check for dangerous patterns
+    dangerous_patterns = [
+        (r"\beval\s*\(", "eval() function"),
+        (r"\bexec\s*\(", "exec() function"),
+        (r"\b__import__\s*\(", "__import__() function"),
+        (r"\bcompile\s*\(", "compile() function"),
+        (r"open\s*\([^)]*['\"]w", "file write operation"),
+        (r"\bshutil\.", "shutil module usage"),
+        (r"\bos\.system", "os.system() call"),
+        (r"\bsubprocess\.", "subprocess module usage"),
+    ]
+    
+    for pattern, description in dangerous_patterns:
+        if re.search(pattern, code, re.IGNORECASE):
+            issues.append(f"Suspicious pattern: {description}")
+    
+    is_safe = len(issues) == 0
+    
+    if not is_safe:
+        logger.warning(f"Basic safety check found {len(issues)} issue(s)")
+    
+    return is_safe, issues
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 def parse_text_to_json(question: str, *, model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Parse natural-language `question` to structured JSON using Gemini parser model.
-    If the model output is invalid JSON, fall back to heuristic minimal structure.
+    Parse natural language question into structured JSON.
+    
+    Pipeline:
+    1. Try LLM parsing (if available)
+    2. Fallback to heuristic extraction
+    3. Normalize and validate structure
+    
+    Args:
+        question: Natural language math question
+        model_cfg: Optional model configuration overrides
+    
+    Returns:
+        Structured dictionary with:
+        - problem_type: Type classification
+        - raw_question: Original text
+        - goal: What to accomplish
+        - equations: List of equation objects
+        - unknowns: List of variables
+        - notes: Additional metadata
     """
-    logger.info("parse_text_to_json called; parser_model=%s PIBOT_USE_LLM=%s", PARSER_MODEL, PIBOT_USE_LLM)
-    prompt_template = _read_prompt("parser.md") or (
-        "Parse the following math question into JSON with keys: problem_type, raw_question, goal, equations (list of {lhs,rhs}), unknowns (list)."
-    )
-    prompt = f"{prompt_template}\n\n# QUESTION:\n{question}\n\n# OUTPUT JSON:\n"
+    logger.info(f"Parsing question ({len(question)} chars)")
 
-    if PIBOT_USE_LLM and PIBOT_LLM_PROVIDER == "gemini":
+    prompt_template = _read_prompt("parser.md")
+    if not prompt_template:
+        prompt_template = """Parse the following mathematical question into structured JSON.
+
+Return a JSON object with these fields:
+- problem_type: "equation" | "system" | "inequality" | "expression"
+- raw_question: original question text
+- goal: "solve" | "simplify" | "evaluate"
+- equations: array of {lhs: "...", rhs: "..."}
+- unknowns: array of variable names
+
+Return ONLY the JSON object, no explanation.
+
+Example:
+{
+  "problem_type": "equation",
+  "raw_question": "Solve for x: 2x + 5 = 13",
+  "goal": "solve",
+  "equations": [{"lhs": "2*x + 5", "rhs": "13"}],
+  "unknowns": ["x"]
+}"""
+    full_prompt = f"{prompt_template}\n\n# QUESTION:\n{question}\n\n# JSON:\n"
+
+    # Try LLM parsing
+    if PIBOT_USE_LLM and PIBOT_LLM_PROVIDER == "gemini" and client:
         try:
-            raw = _call_gemini(prompt, model=PARSER_MODEL, temperature=PARSER_TEMP)
-            parsed = _extract_json_from_text(raw)
-            if parsed is None:
-                logger.warning("Parser model did not return valid JSON — falling back to heuristics. Raw output snippet:\n%s", (raw or "")[:1000])
-            else:
-                # Normalize equations: allow either list-of-pairs or list-of-objects
-                eqs = parsed.get("equations", [])
-                normalized = []
-                for e in eqs:
-                    if isinstance(e, dict) and "lhs" in e and "rhs" in e:
-                        normalized.append({"lhs": e["lhs"], "rhs": e["rhs"]})
-                    elif isinstance(e, (list, tuple)) and len(e) >= 2:
-                        normalized.append({"lhs": e[0], "rhs": e[1]})
-                parsed["equations"] = normalized
-                parsed.setdefault("raw_question", question)
-                parsed.setdefault("goal", parsed.get("goal", "solve"))
-                # ensure unknowns exist
-                if not parsed.get("unknowns"):
-                    parsed["unknowns"] = utils.detect_unknowns([(d["lhs"], d["rhs"]) for d in normalized]) if normalized else ["x"]
+            logger.debug("Attempting LLM parsing...")
+            response_text = _call_gemini(
+                full_prompt,
+                model=PARSER_MODEL,
+                temperature=PARSER_TEMP
+            )
+            
+            parsed = _extract_json_from_text(response_text)
+
+            if parsed and isinstance(parsed, dict):
+                # Normalize
+                parsed = normalize_parsed_structure(parsed, question)
+                logger.info(f"✓ LLM parsing successful: {parsed.get('problem_type')}")
                 return parsed
+            else:
+                logger.warning("LLM returned invalid JSON, using fallback")
+
         except Exception as e:
-            logger.exception("Parser LLM error: %s", e)
+            logger.error(f"LLM parsing failed: {e}")            
 
     # Heuristic fallback
+    logger.info("Using heuristic parser")
+    return heuristic_parse(question)
+
+def heuristic_parse(question: str) -> Dict[str, Any]:
+    """
+    Fallback heuristic parser using regex and pattern matching.
+    
+    Args:
+        question: Question text
+    
+    Returns:
+        Basic structured representation
+    """
     try:
-        eqs = utils.extract_equations(question)
-        unknowns = utils.detect_unknowns(eqs) if eqs else ["x"]
-        # convert to list-of-dicts for consistency
-        eqs_norm = [{"lhs": l, "rhs": r} for l, r in eqs]
-        return {"raw_question": question, "equations": eqs_norm, "unknowns": unknowns, "goal": "solve", "notes": "heuristic-fallback"}
+        equations = utils.extract_equations(question)
+        unknowns = utils.detect_unknowns(equations) if equations else ["x"]
+        
+        equations_normalized = [
+            {"lhs": lhs, "rhs": rhs}
+            for lhs, rhs in equations
+        ]
+        
+        problem_type = "equation" if len(equations) == 1 else "system"
+        
+        logger.debug(
+            f"Heuristic parse: {problem_type}, "
+            f"{len(equations_normalized)} equation(s), "
+            f"unknowns={unknowns}"
+        )
+        
+        return {
+            "problem_type": problem_type,
+            "raw_question": question,
+            "goal": "solve",
+            "equations": equations_normalized,
+            "unknowns": unknowns,
+            "notes": "heuristic-fallback"
+        }
+    
     except Exception as e:
-        logger.exception("Heuristic fallback failed: %s", e)
-        return {"raw_question": question, "equations": [], "unknowns": ["x"], "goal": "solve", "notes": "error-fallback"}
+        logger.error(f"Heuristic parsing failed: {e}")
+        return {
+            "problem_type": "unknown",
+            "raw_question": question,
+            "goal": "solve",
+            "equations": [],
+            "unknowns": ["x"],
+            "notes": f"error-fallback: {str(e)}"
+        }
+
+def normalize_parsed_structure(
+    parsed: Dict[str, Any],
+    original_question: str
+) -> Dict[str, Any]:
+    """
+    Normalize and validate LLM-parsed structure.
+    
+    Ensures all required fields are present and properly formatted.
+    
+    Args:
+        parsed: Raw parsed data from LLM
+        original_question: Original question (for filling gaps)
+    
+    Returns:
+        Normalized structure
+    """
+    # Ensure required fields
+    parsed.setdefault("raw_question", original_question)
+    parsed.setdefault("problem_type", "equation")
+    parsed.setdefault("goal", "solve")
+    parsed.setdefault("unknowns", ["x"])
+    
+    # Normalize equations to consistent format
+    equations = parsed.get("equations", [])
+    normalized_equations = []
+    
+    for eq in equations:
+        if isinstance(eq, dict) and "lhs" in eq and "rhs" in eq:
+            normalized_equations.append({
+                "lhs": str(eq["lhs"]),
+                "rhs": str(eq["rhs"])
+            })
+        elif isinstance(eq, (list, tuple)) and len(eq) >= 2:
+            normalized_equations.append({
+                "lhs": str(eq[0]),
+                "rhs": str(eq[1])
+            })
+        else:
+            logger.warning(f"Skipping malformed equation: {eq}")
+    
+    parsed["equations"] = normalized_equations
+    
+    # Ensure unknowns exist
+    if not parsed.get("unknowns") and normalized_equations:
+        eq_tuples = [(eq["lhs"], eq["rhs"]) for eq in normalized_equations]
+        parsed["unknowns"] = utils.detect_unknowns(eq_tuples)
+    
+    return parsed
 
 def generate_python_from_json(structured: Dict[str, Any], *, model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Generate Python code from structured JSON using Gemini codegen model.
-    Returns: {"mode": "llm_codegen"|"sympy_stub", "code": <str>|None, "metadata": {...}}
+    Generate executable Python code from structured problem data.
+    
+    Pipeline:
+    1. Try LLM code generation (if available)
+    2. Validate generated code for safety
+    3. Fallback to sympy_stub mode if needed
+    
+    Args:
+        structured: Structured problem representation
+        model_cfg: Optional model configuration
+    
+    Returns:
+        Dictionary with:
+        - mode: "llm_codegen" or "sympy_stub"
+        - code: Generated Python code string (or None)
+        - metadata: Generation details
     """
-    logger.info("generate_python_from_json called; codegen_model=%s PIBOT_USE_LLM=%s", CODEGEN_MODEL, PIBOT_USE_LLM)
+    logger.info("Generating solver code")
     if not isinstance(structured, dict):
-        return {"mode": "sympy_stub", "code": None, "metadata": {"error": "invalid_structured"}}
+        logger.error("Invalid structured input (not a dict)")
+        return {
+            "mode": "sympy_stub",
+            "code": None,
+            "metadata": {"error": "invalid_input_type"}
+        }
+    
+    # Load code generation prompt
+    prompt_template = _read_prompt("codegen.md")
+    if not prompt_template:
+        prompt_template = """Generate a Python script to solve this mathematical problem.
 
-    prompt_template = _read_prompt("codegen.md") or (
-        "Generate a Python script that reads no external data, solves the following structured problem, and prints a JSON result to stdout.\n"
-        "Return only raw Python code (no markdown fences, no explanations). Allowed imports: json, math, sympy."
-    )
-    structured_str = json.dumps(structured, ensure_ascii=False, indent=2)
-    prompt = f"{prompt_template}\n\n# STRUCTURED_INPUT:\n{structured_str}\n\n# PYTHON SCRIPT (only code, no commentary):\n"
+Requirements:
+- Import ONLY: json, math, sympy
+- No external data or network access
+- Print result as JSON to stdout
+- Include error handling
+- Use standard output format:
+  {
+    "problem_type": "...",
+    "solution": {"unknown": "x", "values": [...]},
+    "answer": "..."
+  }
 
-    if PIBOT_USE_LLM and PIBOT_LLM_PROVIDER == "gemini":
+Return ONLY raw Python code - no markdown fences, no explanations."""
+
+    structured_json = json.dumps(structured, ensure_ascii=False, indent=2)
+    full_prompt = f"{prompt_template}\n\n# PROBLEM:\n{structured_json}\n\n# CODE:\n"
+
+    # Try LLM code generation
+    if PIBOT_USE_LLM and PIBOT_LLM_PROVIDER == "gemini" and client:
         try:
-            raw = _call_gemini(prompt, model=CODEGEN_MODEL, temperature=CODEGEN_TEMP)
-            # unwrap fencing if present
-            cleaned = unwrap_markdown_code(raw)
-            # Quick static heuristic: disallow obvious forbidden imports
-            if _FORBIDDEN_IMPORT_RE.search(cleaned):
-                logger.warning("Codegen returned unsafe imports - rejecting generated code.")
-                return {"mode": "sympy_stub", "code": None, "metadata": {"reason": "unsafe_import_detected"}}
-            if not cleaned.strip():
-                logger.warning("Codegen returned empty code - falling back.")
-                return {"mode": "sympy_stub", "code": None, "metadata": {"reason": "empty_codegen"}}
-            return {"mode": "llm_codegen", "code": cleaned, "metadata": {"model": CODEGEN_MODEL}}
+            logger.debug("Attempting LLM code generation...")
+            response_text = _call_gemini(
+                full_prompt,
+                model=CODEGEN_MODEL,
+                temperature=CODEGEN_TEMP
+            )
+            
+            # Clean up markdown fences
+            code = unwrap_markdown_code(response_text)
+
+            # Basic safety pre-check
+            is_safe, issues = check_code_safety_basic(code)
+            
+            if not is_safe:
+                logger.warning(f"Generated code failed basic safety check: {issues}")
+                return {
+                    "mode": "sympy_stub",
+                    "code": None,
+                    "metadata": {
+                        "reason": "safety_precheck_failed",
+                        "issues": issues
+                    }
+                }
+            
+            if not code.strip():
+                logger.warning("LLM returned empty code")
+                return {
+                    "mode": "sympy_stub",
+                    "code": None,
+                    "metadata": {"reason": "empty_code"}
+                }
+        
+            logger.info(f"✓ Code generation successful ({len(code)} chars, {code.count(chr(10))+1} lines)")
+            return {
+                "mode": "llm_codegen",
+                "code": code,
+                "metadata": {
+                    "model": CODEGEN_MODEL,
+                    "code_length": len(code),
+                    "code_lines": code.count("\n") + 1
+                }
+            }
+        
         except Exception as e:
-            logger.exception("Codegen LLM failed: %s", e)
-            return {"mode": "sympy_stub", "code": None, "metadata": {"error": str(e)}}
+            logger.error(f"Code generation failed: {e}")
 
-    # Default safe fallback to sympy
-    return {"mode": "sympy_stub", "code": None, "metadata": {"reason": "llm_disabled_or_provider_not_gemini"}}
+    # Fallback
+    logger.info("Using sympy_stub fallback")
+    return {
+        "mode": "sympy_stub",
+        "code": None,
+        "metadata": {"reason": "llm_unavailable_or_failed"}
+    }
 
-def explain_result(question: str,
-                   execution_output: Dict[str, Any],
-                   generated_code: Optional[str] = None,
-                   *,
-                   model_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+
+def explain_result(
+    question: str,
+    execution_output: Dict[str, Any],
+    generated_code: Optional[str] = None,
+    *,
+    model_cfg: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    Produce an HTML explanation using Gemini explainer model.
-
-    Accepts optional `generated_code` (string) so the explainer can use the actual solver
-    script as context when producing step-by-step instructions.
-
-    Fallback behavior:
-      - If the model returns empty/whitespace, build a simple deterministic HTML explanation
-        from execution_output (equations + solution).
+    Generate human-readable HTML explanation of solution.
+    
+    Pipeline:
+    1. Try LLM explanation (if available)
+    2. Fallback to deterministic HTML generation
+    
+    Args:
+        question: Original question
+        execution_output: Execution/solution result
+        generated_code: Optional solver code for context
+        model_cfg: Optional model configuration
+    
+    Returns:
+        Dictionary with:
+        - steps_html: HTML explanation
+        - confidence: Confidence score (0.0-1.0)
     """
-    logger.info("explain_result called; explain_model=%s", EXPLAIN_MODEL)
+    logger.info("Generating solution explanation")
+
     if not execution_output:
-        return {"steps_html": "<p>No result to explain.</p>", "confidence": 0.0}
+        return {
+            "steps_html": "<p>No result to explain.</p>",
+            "confidence": 0.0
+        }
+    # Load explanation prompt
+    prompt_template = _read_prompt("explain.md")
+    if not prompt_template:
+        prompt_template = """Generate a clear, step-by-step explanation of this solution.
 
-    # Compose the prompt: include question, result JSON and optionally the generated code
-    prompt_template = _read_prompt("explain.md") or (
-        "Given the QUESTION, the SOLVER_RESULT (JSON) and the SOLVER_CODE (if present), "
-        "produce a clear step-by-step explanation in HTML for a high-school student. "
-        "Return only the explanation text (HTML)."
-    )
+Requirements:
+- Target audience: High school student
+- Format: Clean HTML with proper structure
+- Include: Problem statement, solution steps, final answer
+- Be concise but thorough
 
-    result_str = json.dumps(execution_output, ensure_ascii=False, indent=2)
-    code_str = generated_code or ""
-    # unwrap code fences if user passed the file contents
-    code_str = unwrap_markdown_code(code_str)
+Return ONLY the HTML explanation, no markdown fences."""
 
-    prompt_parts = [
-        prompt_template,
-        "\n# QUESTION:\n",
-        question,
-        "\n\n# RESULT_JSON:\n",
-        result_str,
-    ]
-    if code_str:
-        prompt_parts += ["\n\n# SOLVER_CODE (for context):\n", code_str[:4000]]  # limit length to be safe
-    prompt_parts += ["\n\n# EXPLANATION (HTML):\n"]
+    # Prepare context
+    result_json = json.dumps(execution_output, ensure_ascii=False, indent=2)
+    code_context = ""
+    
+    if generated_code:
+        code_clean = utils.unwrap_markdown_code(generated_code)
+        # Limit code length to avoid token limits
+        code_context = f"\n\n# SOLVER CODE:\n```python\n{code_clean[:2500]}\n```"
+    
+    full_prompt = f"""{prompt_template}
 
-    prompt = "".join(prompt_parts)
+# QUESTION:
+{question}
 
-    try:
-        raw = _call_gemini(prompt, model=EXPLAIN_MODEL, temperature=EXPLAIN_TEMP)
-        # If model returns nothing meaningful, fallback to deterministic builder
-        if raw is None:
-            raw = ""
-        raw = raw.strip()
-        if raw == "":
-            logger.warning("Explainer model returned empty output; using fallback explanation.")
-            raise RuntimeError("empty_explainer_output")
-        # Some models might return fenced Markdown with JSON or code; we assume it's HTML/text
-        steps_html = raw
-        return {"steps_html": steps_html, "confidence": 1.0}
-    except Exception as e:
-        logger.exception("Explainer LLM failed or returned empty: %s", e)
+# SOLUTION RESULT:
+{result_json}{code_context}
 
-        # Fallback: build a deterministic HTML explanation from execution_output + (optional) code
+# HTML EXPLANATION:
+"""
+     # Try LLM explanation
+    if PIBOT_USE_LLM and PIBOT_LLM_PROVIDER == "gemini" and client:
         try:
-            # Prefer structured.solutions if present
-            sol = None
-            if isinstance(execution_output.get("structured"), dict):
-                sol = execution_output["structured"].get("solutions")
-            if sol is None:
-                sol = execution_output.get("answer") or execution_output.get("solutions")
+            logger.debug("Attempting LLM explanation generation...")
+            response_text = _call_gemini(
+                full_prompt,
+                model=EXPLAIN_MODEL,
+                temperature=EXPLAIN_TEMP
+            )
+            
+            if response_text and response_text.strip():
+                logger.info(f"✓ Explanation generated ({len(response_text)} chars)")
+                return {
+                    "steps_html": response_text.strip(),
+                    "confidence": 1.0
+                }
+        
+        except Exception as e:
+            logger.error(f"Explanation generation failed: {e}")
 
-            # Build simple explanation html
-            parts = []
-            parts.append(f"<p><strong>Question:</strong> {question}</p>")
-            # If structured contains equations, show them
-            structured = execution_output.get("structured", {})
-            eqs = structured.get("equations") if isinstance(structured, dict) else None
-            if not eqs:
-                # try to infer simple equation(s) from execution_output.answer or steps
-                eqs = None
+    # Fallback to deterministic explanation
+    logger.info("Using fallback explanation generator")
+    return generate_fallback_explanation(question, execution_output, generated_code)
 
-            if eqs:
-                parts.append("<p><strong>Equation(s):</strong></p><ol>")
-                # eqs may be list of lists or dicts; attempt to render
-                for e in eqs:
-                    if isinstance(e, (list, tuple)) and len(e) == 2:
-                        lhs, rhs = e
-                        parts.append(f"<li>$$ {lhs} = {rhs} $$</li>")
-                    elif isinstance(e, dict):
-                        lhs = e.get("lhs"); rhs = e.get("rhs")
-                        if lhs and rhs:
-                            parts.append(f"<li>$$ {lhs} = {rhs} $$</li>")
-                        else:
-                            parts.append(f"<li>{json.dumps(e)}</li>")
-                    else:
-                        parts.append(f"<li>{e}</li>")
-                parts.append("</ol>")
-
-            # solution
-            parts.append("<p><strong>Solution:</strong></p>")
-            if isinstance(sol, (list, tuple)):
-                parts.append("<p>" + ", ".join(str(s) for s in sol) + "</p>")
+def generate_fallback_explanation(
+    question: str,
+    result: Dict[str, Any],
+    code: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Generate basic HTML explanation when LLM is unavailable.
+    
+    Args:
+        question: Original question
+        result: Solution result
+        code: Optional solver code
+    
+    Returns:
+        Dictionary with steps_html and confidence
+    """
+    parts = []
+    
+    # Container start
+    parts.append("<div style='font-family: Arial, sans-serif; line-height: 1.8; color: #333;'>")
+    
+    # Problem statement
+    parts.append("<h3 style='color: #1976d2; border-bottom: 2px solid #1976d2; padding-bottom: 0.5rem;'>Problem</h3>")
+    parts.append(f"<p><strong>{question}</strong></p>")
+    
+    # Equations (if available)
+    structured = result.get("structured", {})
+    equations = structured.get("equations", []) if isinstance(structured, dict) else []
+    
+    if equations:
+        parts.append("<h3 style='color: #1976d2;'>Equation(s)</h3>")
+        parts.append("<ol style='padding-left: 2rem;'>")
+        for eq in equations:
+            if isinstance(eq, dict):
+                lhs = eq.get("lhs", "")
+                rhs = eq.get("rhs", "")
+                if lhs and rhs:
+                    parts.append(f"<li style='margin: 0.5rem 0;'><code>{lhs} = {rhs}</code></li>")
+        parts.append("</ol>")
+    
+    # Solution
+    solution = result.get("solution")
+    if solution and isinstance(solution, dict):
+        unknown = solution.get("unknown", "x")
+        values = solution.get("values", [])
+        
+        if values:
+            parts.append("<h3 style='color: #1976d2;'>Solution</h3>")
+            if len(values) == 1:
+                parts.append(
+                    f"<p style='font-size: 1.2rem; font-weight: bold; color: #2e7d32;'>"
+                    f"{unknown} = {values[0]}</p>"
+                )
             else:
-                parts.append(f"<p>{sol}</p>")
+                values_str = ", ".join(str(v) for v in values)
+                parts.append(
+                    f"<p style='font-size: 1.2rem; font-weight: bold; color: #2e7d32;'>"
+                    f"{unknown} = {values_str}</p>"
+                )
+    
+    # Validation status
+    validation = result.get("validation", {})
+    if validation.get("ok"):
+        parts.append(
+            "<p style='color: #2e7d32;'>"
+            "✓ Solution verified by substitution into original equation(s)</p>"
+        )
+    
+    # Note
+    parts.append(
+        "<p style='color: #666; font-size: 0.9rem; font-style: italic; "
+        "margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #ddd;'>"
+        "Note: This explanation was generated using deterministic methods.</p>"
+    )
+    
+    parts.append("</div>")
+    
+    return {
+        "steps_html": "".join(parts),
+        "confidence": 0.5
+    }
 
-            # include a small deterministic step-by-step if possible
-            # e.g., if a linear equation of form ax + b = c, show isolate x
-            # Simple heuristic: if single equation string present, try to perform naive steps
-            # (we won't run external code here)
-            try:
-                # add code snippet context if present
-                if code_str:
-                    parts.append("<p><strong>Solver code (summary):</strong></p>")
-                    # avoid dumping giant code; show first 20 lines
-                    snippet = "\n".join(code_str.splitlines()[:20])
-                    parts.append(f"<pre>{snippet}</pre>")
-            except Exception:
-                pass
-
-            parts.append("<p>Note: explanation generated deterministically as fallback.</p>")
-
-            steps_html = "".join(parts)
-            return {"steps_html": steps_html, "confidence": 0.0}
-        except Exception as e2:
-            logger.exception("Fallback explainer building failed: %s", e2)
-            return {"steps_html": "<p>Could not generate explanation.</p>", "confidence": 0.0}
-
-
-
-# -------------------------
-# CLI for quick local testing
-# -------------------------
+# ============================================================================
+# CLI FOR TESTING
+# ============================================================================
 if __name__ == "__main__":
     import argparse, sys
 
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd")
+    parser = argparse.ArgumentParser(description="LLM Wrapper CLI Tool")
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute") 
 
-    p = sub.add_parser("parse")
-    p.add_argument("question", nargs="+")
-    c = sub.add_parser("codegen")
-    c.add_argument("jsonfile")
-    e = sub.add_parser("explain")
-    e.add_argument("question", nargs="+")
-    e.add_argument("resultfile")
-    e.add_argument("--code", "-c", help="Optional path to generated solver code (python)")
-
-
+    # Parse command
+    parse_parser = subparsers.add_parser("parse", help="Parse question to JSON")
+    parse_parser.add_argument("question", nargs="+", help="Question text")
+    
+    # Codegen command
+    codegen_parser = subparsers.add_parser("codegen", help="Generate code from JSON")
+    codegen_parser.add_argument("jsonfile", help="Path to structured JSON file")
+    codegen_parser.add_argument("--output", "-o", help="Output file for generated code")
+    
+    # Explain command
+    explain_parser = subparsers.add_parser("explain", help="Generate explanation")
+    explain_parser.add_argument("question", nargs="+", help="Question text")
+    explain_parser.add_argument("resultfile", help="Path to result JSON file")
+    explain_parser.add_argument("--code", "-c", help="Optional path to solver code")
+    explain_parser.add_argument("--output", "-o", help="Output file for HTML")
+    
     args = parser.parse_args()
-    if args.cmd == "parse":
-        q = " ".join(args.question)
-        out = parse_text_to_json(q)
-        print(json.dumps(out, indent=2, ensure_ascii=False))
-    elif args.cmd == "codegen":
-        with open(args.jsonfile, "r", encoding="utf8") as f:
+
+    if args.command == "parse":
+        question = " ".join(args.question)
+        result = parse_text_to_json(question)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    
+    elif args.command == "codegen":
+        with open(args.jsonfile, "r", encoding="utf-8") as f:
             structured = json.load(f)
-        out = generate_python_from_json(structured)
-        print(json.dumps(out, indent=2, ensure_ascii=False))
-    elif args.cmd == "explain":
-        q = " ".join(args.question)
-        # load result JSON
-        with open(args.resultfile, "r", encoding="utf8") as f:
-            res = json.load(f)
-        generated_code = None
-        if getattr(args, "code", None):
+        result = generate_python_from_json(structured)
+        
+        if args.output and result.get("code"):
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(result["code"])
+            print(f"Code written to: {args.output}")
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif args.command == "explain":
+        question = " ".join(args.question)
+        
+        with open(args.resultfile, "r", encoding="utf-8") as f:
+            result_data = json.load(f)
+        
+        code = None
+        if args.code:
             try:
-                with open(args.code, "r", encoding="utf8") as cf:
-                    generated_code = cf.read()
+                with open(args.code, "r", encoding="utf-8") as f:
+                    code = f.read()
             except Exception as e:
-                logger.warning("Could not read code file %s: %s", args.code, e)
-        out = explain_result(q, res, generated_code)
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+                logger.warning(f"Could not read code file: {e}")
+        
+        result = explain_result(question, result_data, code)
+        
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(result["steps_html"])
+            print(f"Explanation written to: {args.output}")
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+    
     else:
         parser.print_help()

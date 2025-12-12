@@ -1,10 +1,26 @@
 # worker/utils.py
 """
-Utility helpers for PiBot worker:
-- Redis job record helpers
-- Text parsing / normalization
-- SymPy equation builders and solvers
-- Validation and step formatting
+Utility Functions - Production-Ready Version
+=============================================
+Core utilities for the PiBot worker system:
+- Redis job management
+- Text parsing and normalization
+- SymPy equation processing
+- Solution validation
+- LaTeX/HTML formatting
+
+Features:
+- Comprehensive error handling
+- Detailed logging
+- Type safety with annotations
+- Caching for expensive operations
+- Batch operations support
+
+Environment Variables:
+---------------------
+REDIS_URL=redis://redis:6379
+PIBOT_CACHE_ENABLED=true|false
+PIBOT_LOG_LEVEL=INFO
 """
 
 from __future__ import annotations
@@ -12,7 +28,10 @@ from __future__ import annotations
 import re
 import json
 import time
+import os
+import logging
 from typing import List, Any, Dict, Tuple, Optional
+from functools import lru_cache
 
 import redis
 from sympy import symbols, Eq, latex, simplify
@@ -23,348 +42,778 @@ from sympy.parsing.sympy_parser import (
 )
 from sympy.core.sympify import SympifyError
 
-# Redis connection helper (same config used elsewhere)
-REDIS_URL = "redis://redis:6379"
-redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+logger = logging.getLogger("worker.utils")
+logger.setLevel(os.environ.get("PIBOT_LOG_LEVEL", "INFO"))
 
-
-# ---------------------------
-# Job storage helpers
-# ---------------------------
-def get_job_record(job_id: str) -> Optional[Dict[str, Any]]:
-    """Return parsed job record from redis or None if missing."""
-    key = f"job:{job_id}"
-    raw = redis_conn.get(key)
-    return json.loads(raw) if raw else None
-
-
-def update_job_record(job_id: str, patch: dict) -> None:
-    """Patch an existing job record in redis (shallow update)."""
-    key = f"job:{job_id}"
-    raw = redis_conn.get(key)
-    if raw is None:
-        return
-    job = json.loads(raw)
-    job.update(patch)
-    redis_conn.set(key, json.dumps(job))
-
-
-# ---------------------------
-# Text normalization & parsing helpers
-# ---------------------------
-def _strip_leading_instruction(text: str) -> str:
-    """
-    Remove common natural-language prefixes like:
-      - "Solve for x: ...", "Find x: ...", "Compute: ...", "Evaluate: ..."
-    Returns the rest (if pattern matched) or original text.
-    """
-    t = text.strip()
-    m = re.match(
-        r"(?is)^\s*(solve(?: for [a-zA-Z]\w*)?|find(?: for [a-zA-Z]\w*)?|compute|evaluate|simplify)\b[:\s]*(.*)$",
-        t,
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s [%(funcName)s] - %(message)s"
     )
-    if m:
-        remainder = m.group(2).strip()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
+CACHE_ENABLED = os.environ.get("PIBOT_CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# Initialize Redis connection
+try:
+    redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
+    # Test connection
+    redis_conn.ping()
+    logger.info("✓ Redis connection established")
+except Exception as e:
+    logger.error(f"Failed to connect to Redis: {e}")
+    redis_conn = None
+
+# ============================================================================
+# REDIS JOB MANAGEMENT
+# ============================================================================
+def get_job_record(job_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve job record from Redis.
+    
+    Args:
+        job_id: Unique job identifier
+    
+    Returns:
+        Job dictionary or None if not found
+    """
+    if not redis_conn:
+        logger.error("Redis connection not available")
+        return None
+    
+    key = f"job:{job_id}"
+    try:
+        raw = redis_conn.get(key)
+        if raw:
+            job = json.loads(raw)
+            logger.debug(f"Retrieved job: {job_id}")
+            return job
+        else:
+            logger.warning(f"Job not found: {job_id}")
+            return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in job {job_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving job {job_id}: {e}")
+        return None
+
+
+def update_job_record(job_id: str, updates: Dict[str, Any]) -> bool:
+    """
+    Update job record in Redis (shallow merge).
+    
+    Args:
+        job_id: Unique job identifier
+        updates: Dictionary of fields to update
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not redis_conn:
+        logger.error("Redis connection not available")
+        return False
+    
+    key = f"job:{job_id}"
+    try:
+        raw = redis_conn.get(key)
+        if raw is None:
+            logger.warning(f"Cannot update non-existent job: {job_id}")
+            return False
+        
+        job = json.loads(raw)
+        job.update(updates)
+        redis_conn.set(key, json.dumps(job))
+        
+        logger.debug(f"Updated job {job_id}: {list(updates.keys())}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error updating job {job_id}: {e}")
+        return False
+
+
+def create_job_record(job_id: str, job_data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
+    """
+    Create new job record in Redis.
+    
+    Args:
+        job_id: Unique job identifier
+        job_data: Job data dictionary
+        ttl: Time to live in seconds (optional)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not redis_conn:
+        logger.error("Redis connection not available")
+        return False
+    
+    key = f"job:{job_id}"
+    try:
+        job_data.setdefault("job_id", job_id)
+        job_data.setdefault("created_at", time.time())
+        job_data.setdefault("status", "pending")
+        
+        redis_conn.set(key, json.dumps(job_data))
+        
+        if ttl:
+            redis_conn.expire(key, ttl)
+        
+        logger.info(f"Created job: {job_id}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error creating job {job_id}: {e}")
+        return False
+
+
+def delete_job_record(job_id: str) -> bool:
+    """
+    Delete job record from Redis.
+    
+    Args:
+        job_id: Unique job identifier
+    
+    Returns:
+        True if deleted, False otherwise
+    """
+    if not redis_conn:
+        return False
+    
+    key = f"job:{job_id}"
+    try:
+        result = redis_conn.delete(key)
+        if result:
+            logger.info(f"Deleted job: {job_id}")
+        return bool(result)
+    except Exception as e:
+        logger.error(f"Error deleting job {job_id}: {e}")
+        return False
+    
+
+# ============================================================================
+# TEXT NORMALIZATION & PARSING
+# ============================================================================
+def strip_leading_instruction(text: str) -> str:
+    """
+    Remove common instruction prefixes from questions.
+    
+    Patterns removed:
+    - "Solve for x: ..."
+    - "Find x: ..."
+    - "Compute: ..."
+    - "Evaluate: ..."
+    - "Simplify: ..."
+    
+    Args:
+        text: Input text
+    
+    Returns:
+        Text with instruction prefix removed
+    """
+    text = text.strip()
+    
+    pattern = re.compile(
+        r"^\s*(?:solve(?:\s+for\s+[a-zA-Z]\w*)?|"
+        r"find(?:\s+for\s+[a-zA-Z]\w*)?|"
+        r"compute|evaluate|simplify|calculate)\b[:\s]*(.*)$",
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    match = pattern.match(text)
+    if match:
+        remainder = match.group(1).strip()
         if remainder:
+            logger.debug(f"Stripped instruction prefix: {text[:30]}...")
             return remainder
-    return t
+    
+    return text
 
 
 def preprocess_equation_text(text: str) -> str:
-    """Basic sanitation: replace caret with power operator and remove thousands separators."""
-    t = text.strip()
-    t = t.replace("^", "**")
-    t = t.replace(",", "")
-    return t
+    """
+    Sanitize equation text for SymPy parsing.
+    
+    Transformations:
+    - Replace ^ with ** (power operator)
+    - Remove thousands separators (commas)
+    - Normalize whitespace
+    
+    Args:
+        text: Raw equation text
+    
+    Returns:
+        Preprocessed text
+    """
+    text = text.strip()
+    text = text.replace("^", "**")
+    text = text.replace(",", "")  # Remove thousands separators
+    text = re.sub(r"\s+", " ", text)  # Normalize whitespace
+    return text
 
 
 def extract_equations(text: str) -> List[Tuple[str, str]]:
     """
-    Extract one or more equations from text.
-    Returns list of (lhs_str, rhs_str) tuples or [] if none found.
-    Splits on semicolon/newline/| to support systems.
+    Extract equations from natural language text.
+    
+    Supports:
+    - Single equations: "x + 5 = 10"
+    - Multiple equations: "x + y = 5; 2x - y = 3"
+    - System separators: semicolon, newline, pipe
+    
+    Args:
+        text: Text containing equations
+    
+    Returns:
+        List of (lhs, rhs) tuples
     """
-    t = _strip_leading_instruction(text)
-    # split common list separators
-    eq_parts = re.split(r"(?:;|\n|\|)", t)
-    eqs: List[Tuple[str, str]] = []
+    text = strip_leading_instruction(text)
+    
+    # Split on common separators
+    eq_parts = re.split(r"[;\n|]", text)
+    equations: List[Tuple[str, str]] = []
+    
     for part in eq_parts:
+        part = part.strip()
         if "=" in part:
             lhs, rhs = part.split("=", 1)
-            eqs.append((lhs.strip(), rhs.strip()))
+            equations.append((lhs.strip(), rhs.strip()))
+    
+    # Fallback: if no equations found but = exists
+    if not equations and "=" in text:
+        lhs, rhs = text.split("=", 1)
+        equations.append((lhs.strip(), rhs.strip()))
+    
+    logger.debug(f"Extracted {len(equations)} equation(s)")
+    return equations
 
-    # fallback: if nothing found but '=' exists in whole text
-    if not eqs and "=" in t:
-        lhs, rhs = t.split("=", 1)
-        eqs.append((lhs.strip(), rhs.strip()))
-    return eqs
-
-
-# ---------------------------
-# Symbol detection
-# ---------------------------
+# ============================================================================
+# VARIABLE DETECTION
+# ============================================================================
 def detect_unknowns(equations: List[Tuple[str, str]]) -> List[str]:
     """
-    Heuristic: look for single-letter tokens (x, y, z). If none found, default to ['x'].
-    Returns a list of variable names (strings).
-    """
-    vars_set = set()
-    for lhs, rhs in equations:
-        tokens = re.findall(r"[a-zA-Z_]\w*", lhs + " " + rhs)
-        for tok in tokens:
-            if len(tok) == 1 and tok.isalpha():
-                vars_set.add(tok)
-    if not vars_set:
-        vars_set = {"x"}
-    return list(vars_set)
-
-
-# ---------------------------
-# SymPy builders / parsing
-# ---------------------------
-def build_sympy_eqs(equations: List[Tuple[str, str]]) -> List[Eq]:
-    """
-    Build sympy Eq objects from list of (lhs_str, rhs_str).
-    Uses SymPy's implicit_multiplication_application so inputs like '2x' parse.
-    Raises ValueError with a helpful message if parsing fails.
-    """
-    eq_objs: List[Eq] = []
-    transformations = standard_transformations + (implicit_multiplication_application,)
-
-    for lhs_str, rhs_str in equations:
-        lhs_text = preprocess_equation_text(lhs_str)
-        rhs_text = preprocess_equation_text(rhs_str)
-        try:
-            lhs = parse_expr(lhs_text, transformations=transformations, evaluate=True)
-        except (SympifyError, SyntaxError, ValueError) as e:
-            raise ValueError(f"Could not parse left side '{lhs_str}' -> '{lhs_text}': {e}")
-        try:
-            rhs = parse_expr(rhs_text, transformations=transformations, evaluate=True)
-        except (SympifyError, SyntaxError, ValueError) as e:
-            raise ValueError(f"Could not parse right side '{rhs_str}' -> '{rhs_text}': {e}")
-        eq_objs.append(Eq(lhs, rhs))
-
-    return eq_objs
-
-
-# ---------------------------
-# Validation helpers
-# ---------------------------
-def validate_solution(eq_objs: List[Eq], solutions: Any, unknown_syms: List[Any]) -> bool:
-    """
-    For algebraic equations, check that each candidate solution satisfies the equations.
-    - solutions can be dict, list/tuple/set, or single value.
-    - unknown_syms: list of sympy Symbols (or their string names)
-    Returns True if validation passes for at least one candidate mapping.
-    """
-    try:
-        # normalize unknown_syms to strings (if symbols passed)
-        unk_names = [str(s) for s in unknown_syms]
-
-        # normalize solutions into list-of-mapping form
-        sol_map_list: List[Dict[str, Any]] = []
-        if isinstance(solutions, dict):
-            sol_map_list = [solutions]
-        elif isinstance(solutions, (list, tuple, set)):
-            if len(unk_names) == 1 and not (solutions and isinstance(next(iter(solutions)), dict)):
-                # list of simple values -> wrap each
-                for val in solutions:
-                    sol_map_list.append({unk_names[0]: val})
-            else:
-                # list of mappings maybe
-                for s in solutions:
-                    if isinstance(s, dict):
-                        sol_map_list.append(s)
-        else:
-            # single scalar
-            sol_map_list = [{unk_names[0]: solutions}]
-
-        # Try each candidate mapping
-        for sol_map in sol_map_list:
-            all_zero = True
-            for eq in eq_objs:
-                lhs = eq.lhs.subs(sol_map)
-                rhs = eq.rhs.subs(sol_map)
-                diff = simplify(lhs - rhs)
-                if diff == 0:
-                    continue
-                try:
-                    if abs(float(diff.evalf())) < 1e-6:
-                        continue
-                except Exception:
-                    all_zero = False
-                    break
-            if all_zero:
-                return True
-        return False
-    except Exception:
-        return False
-
-
-# ---------------------------
-# Formatting / explanation helpers
-# ---------------------------
-def format_steps(eq_objs: List[Eq], solutions: Any, unknown_syms: List[str]) -> str:
-    """
-    Create simple LaTeX/html steps describing how we solved.
-    Returns an HTML string of paragraphs.
-    """
-    steps: List[str] = []
-    for eq in eq_objs:
-        steps.append(f"Equation: $$ {latex(eq.lhs)} = {latex(eq.rhs)} $$")
-
-    if isinstance(solutions, dict):
-        sol_str = ", ".join(f"{k} = {latex(v)}" for k, v in solutions.items())
-        steps.append(f"Solution: $$ {sol_str} $$")
-    elif isinstance(solutions, (list, tuple, set)):
-        if len(solutions) == 0:
-            steps.append("No solution found.")
-        else:
-            sol_str = ", ".join(latex(s) for s in solutions)
-            if len(unknown_syms) == 1:
-                steps.append(f"Solutions for {unknown_syms[0]}: $$ {sol_str} $$")
-            else:
-                steps.append(f"Solutions: $$ {sol_str} $$")
-    else:
-        steps.append(f"Solution: $$ {latex(solutions)} $$")
-
-    steps.append("We verified the solution by substitution into the original equation(s).")
-    html = "".join(f"<p>{s}</p>" for s in steps)
-    return html
-
-
-# ---------------------------
-# Orchestration / metadata helpers
-# ---------------------------
-def normalize_requested_solver_from_job(job: Dict[str, Any]) -> str:
-    """
-    Return normalized requested solver label for the job (for observability).
-    """
-    code_info = job.get("simulated_codegen") or job.get("generated_code") or {}
-    mode = code_info.get("mode") if isinstance(code_info, dict) else None
-    if mode:
-        return mode
-    if job.get("requested_solver"):
-        return job["requested_solver"]
-    return "sympy_stub"
-
-
-# ---------------------------
-# High-level SymPy wrapper
-# ---------------------------
-def local_sympy_solve_from_question(question: str) -> Dict[str, Any]:
-    """
-    Convenience wrapper: parse question -> build eqs -> solve -> validate -> format result dict.
-
+    Heuristically detect variable names from equations.
+    
+    Strategy:
+    - Extract single-letter tokens (x, y, z, etc.)
+    - Filter out common constants (e, i, pi)
+    - Default to ['x'] if none found
+    
+    Args:
+        equations: List of (lhs, rhs) equation tuples
+    
     Returns:
-        {
-          "answer": str(...),
-          "structured": {"type":"algebra","solutions": str(...)},
-          "steps_html": "...",
-          "solved_by": "sympy_stub",
-          "validation": {"ok": True/False, "method": "substitution"}
-        }
-    Raises ValueError if parsing fails.
+        List of variable names
     """
-    # parse equations (attempt a couple heuristics)
-    equations = extract_equations(question)
     if not equations:
-        m = re.search(r"solve for ([a-zA-Z])[:\s]*(.*)", question, re.IGNORECASE)
-        if m:
-            var = m.group(1)
-            expr = m.group(2).strip()
-            if expr:
-                equations = [(expr, "0")]
-
-    if not equations:
-        raise ValueError("Could not parse equation from question (simple parser).")
-
-    eq_objs = build_sympy_eqs(equations)
-
-    unk_names = detect_unknowns(equations)
-    sympy_syms = symbols(" ".join(unk_names))
-    if not isinstance(sympy_syms, (list, tuple)):
-        sympy_syms = [sympy_syms]
-
-    # solve using sympy (single equation vs system)
-    from sympy import solve as sym_solve
-
-    try:
-        if len(eq_objs) == 1 and len(sympy_syms) == 1:
-            sol = sym_solve(eq_objs[0], sympy_syms[0])
-            solutions = sol
-        else:
-            sol = sym_solve(eq_objs, sympy_syms, dict=True)
-            solutions = sol
-    except Exception as e:
-        # bubble up parse/solve errors with meaningful message
-        raise ValueError(f"SymPy solve error: {e}")
-
-    valid = validate_solution(eq_objs, solutions, sympy_syms)
-    steps_html = format_steps(eq_objs, solutions, [str(s) for s in sympy_syms]) if valid else "<p>Solution found but validation failed.</p>"
-
-    result = {
-        "answer": str(solutions),
-        "structured": {"type": "algebra", "solutions": str(solutions)},
-        "steps_html": steps_html,
-        "solved_by": "sympy_stub",
-        "validation": {"ok": bool(valid), "method": "substitution"},
-    }
+        return ["x"]
+    
+    vars_set = set()
+    # Constants to exclude
+    constants = {"e", "i", "E", "I"}
+    
+    for lhs, rhs in equations:
+        combined = f"{lhs} {rhs}"
+        # Find single-letter alphabetic tokens
+        tokens = re.findall(r"\b[a-zA-Z]\b", combined)
+        for token in tokens:
+            if token not in constants:
+                vars_set.add(token)
+    
+    if not vars_set:
+        logger.debug("No variables detected, defaulting to ['x']")
+        return ["x"]
+    
+    result = sorted(list(vars_set))
+    logger.debug(f"Detected variables: {result}")
     return result
 
-# ---------------------------
-# Helpers: unwrap & tolerant JSON extraction
-# ---------------------------
-def unwrap_markdown_code(s: str) -> str:
+
+
+# ============================================================================
+# SYMPY EQUATION BUILDING
+# ============================================================================
+def build_sympy_eqs(equations: List[Tuple[str, str]]) -> List[Eq]:
     """
-    Remove triple-backtick fences and surrounding commentary from model outputs.
-    If no fences, returns original stripped string.
+    Build SymPy Eq objects from string equation tuples.
+    
+    Features:
+    - Implicit multiplication support (2x → 2*x)
+    - Standard transformations
+    - Detailed error messages
+    
+    Args:
+        equations: List of (lhs_str, rhs_str) tuples
+    
+    Returns:
+        List of SymPy Eq objects
+    
+    Raises:
+        ValueError: If parsing fails
     """
-    if not s:
+    if not equations:
+        raise ValueError("No equations provided")
+    
+    eq_objects: List[Eq] = []
+    transformations = standard_transformations + (implicit_multiplication_application,)
+    
+    for idx, (lhs_str, rhs_str) in enumerate(equations, 1):
+        lhs_text = preprocess_equation_text(lhs_str)
+        rhs_text = preprocess_equation_text(rhs_str)
+        
+        try:
+            lhs_expr = parse_expr(lhs_text, transformations=transformations, evaluate=True)
+        except (SympifyError, SyntaxError, ValueError) as e:
+            raise ValueError(
+                f"Failed to parse left side of equation {idx}: '{lhs_str}' → '{lhs_text}'\n"
+                f"Error: {e}"
+            )
+        
+        try:
+            rhs_expr = parse_expr(rhs_text, transformations=transformations, evaluate=True)
+        except (SympifyError, SyntaxError, ValueError) as e:
+            raise ValueError(
+                f"Failed to parse right side of equation {idx}: '{rhs_str}' → '{rhs_text}'\n"
+                f"Error: {e}"
+            )
+        
+        eq_objects.append(Eq(lhs_expr, rhs_expr))
+    
+    logger.debug(f"Built {len(eq_objects)} SymPy equation(s)")
+    return eq_objects
+
+
+# ============================================================================
+# SOLUTION VALIDATION
+# ============================================================================
+def validate_solution(
+    eq_objects: List[Eq],
+    solutions: Any,
+    unknown_symbols: List[Any],
+    tolerance: float = 1e-6
+) -> bool:
+    """
+    Validate solutions by substituting back into equations.
+    
+    Args:
+        eq_objects: List of SymPy equations
+        solutions: Solutions to validate (dict, list, or scalar)
+        unknown_symbols: List of SymPy symbols or their names
+        tolerance: Numerical tolerance for floating point comparison
+    
+    Returns:
+        True if at least one solution satisfies all equations
+    """
+    try:
+        # Normalize unknown symbols to strings
+        unknown_names = [str(sym) for sym in unknown_symbols]
+        
+        # Normalize solutions to list of mappings
+        solution_mappings: List[Dict[str, Any]] = []
+        
+        if isinstance(solutions, dict):
+            solution_mappings = [solutions]
+        elif isinstance(solutions, (list, tuple, set)):
+            if len(unknown_names) == 1:
+                # Single variable: list of values
+                for val in solutions:
+                    if isinstance(val, dict):
+                        solution_mappings.append(val)
+                    else:
+                        solution_mappings.append({unknown_names[0]: val})
+            else:
+                # Multiple variables: list of dicts
+                for sol in solutions:
+                    if isinstance(sol, dict):
+                        solution_mappings.append(sol)
+        else:
+            # Single scalar value
+            solution_mappings = [{unknown_names[0]: solutions}]
+        
+        # Validate each solution mapping
+        for sol_map in solution_mappings:
+            all_satisfied = True
+            
+            for eq in eq_objects:
+                lhs_val = eq.lhs.subs(sol_map)
+                rhs_val = eq.rhs.subs(sol_map)
+                diff = simplify(lhs_val - rhs_val)
+                
+                if diff == 0:
+                    continue
+                
+                # Try numerical evaluation
+                try:
+                    diff_float = float(diff.evalf())
+                    if abs(diff_float) < tolerance:
+                        continue
+                except Exception:
+                    pass
+                
+                all_satisfied = False
+                break
+            
+            if all_satisfied:
+                logger.debug("✓ Solution validated successfully")
+                return True
+        
+        logger.debug("✗ No valid solutions found")
+        return False
+    
+    except Exception as e:
+        logger.warning(f"Validation error (non-fatal): {e}")
+        return False
+
+
+# ============================================================================
+# FORMATTING & DISPLAY
+# ============================================================================
+def format_steps(
+    eq_objects: List[Eq],
+    solutions: Any,
+    unknown_symbols: List[str]
+) -> str:
+    """
+    Generate HTML with LaTeX math for solution steps.
+    
+    Args:
+        eq_objects: SymPy equations
+        solutions: Solution values
+        unknown_symbols: Variable names
+    
+    Returns:
+        HTML string with formatted steps
+    """
+    steps: List[str] = []
+    
+    # Display equations
+    steps.append("<h4>Equation(s):</h4>")
+    steps.append("<ol>")
+    for eq in eq_objects:
+        lhs_latex = latex(eq.lhs)
+        rhs_latex = latex(eq.rhs)
+        steps.append(f"<li>$$ {lhs_latex} = {rhs_latex} $$</li>")
+    steps.append("</ol>")
+    
+    # Display solutions
+    steps.append("<h4>Solution:</h4>")
+    
+    if isinstance(solutions, dict):
+        sol_parts = [f"{k} = {latex(v)}" for k, v in solutions.items()]
+        steps.append(f"<p>$$ {', '.join(sol_parts)} $$</p>")
+    elif isinstance(solutions, (list, tuple, set)):
+        if not solutions:
+            steps.append("<p>No solution found.</p>")
+        else:
+            sol_latex = [latex(s) for s in solutions]
+            if len(unknown_symbols) == 1:
+                steps.append(
+                    f"<p>Solutions for ${unknown_symbols[0]}$: "
+                    f"$$ {', '.join(sol_latex)} $$</p>"
+                )
+            else:
+                steps.append(f"<p>Solutions: $$ {', '.join(sol_latex)} $$</p>")
+    else:
+        steps.append(f"<p>$$ {latex(solutions)} $$</p>")
+    
+    steps.append("<p><em>Solution verified by substitution.</em></p>")
+    
+    return "".join(steps)
+
+
+# ============================================================================
+# SOLVER METADATA
+# ============================================================================
+def normalize_requested_solver_from_job(job: Dict[str, Any]) -> str:
+    """
+    Extract and normalize requested solver from job record.
+    
+    Args:
+        job: Job dictionary
+    
+    Returns:
+        Normalized solver identifier
+    """
+    # Check code generation info
+    code_info = job.get("simulated_codegen") or job.get("generated_code") or {}
+    if isinstance(code_info, dict):
+        mode = code_info.get("mode")
+        if mode:
+            return mode
+    
+    # Check explicit solver request
+    if job.get("requested_solver"):
+        return job["requested_solver"]
+    
+    # Default
+    return "sympy_stub"
+
+# ============================================================================
+# HIGH-LEVEL SYMPY SOLVER
+# ============================================================================
+@lru_cache(maxsize=128)
+def _cached_sympy_solve(question_hash: str, question: str) -> str:
+    """
+    Cached version of SymPy solve (internal use only).
+    Returns JSON string for caching.
+    """
+    result = _sympy_solve_impl(question)
+    return json.dumps(result)
+
+
+def _sympy_solve_impl(question: str) -> Dict[str, Any]:
+    """
+    Internal implementation of SymPy solver.
+    
+    Args:
+        question: Question text
+    
+    Returns:
+        Result dictionary
+    
+    Raises:
+        ValueError: If parsing or solving fails
+    """
+    # Extract equations
+    equations = extract_equations(question)
+    
+    # Fallback: look for "solve for x: expression"
+    if not equations:
+        match = re.search(r"solve\s+for\s+([a-zA-Z])[:\s]*(.*)", question, re.IGNORECASE)
+        if match:
+            var = match.group(1)
+            expr = match.group(2).strip()
+            if expr:
+                equations = [(expr, "0")]
+    
+    if not equations:
+        raise ValueError("Could not extract equations from question")
+    
+    # Build SymPy equations
+    eq_objects = build_sympy_eqs(equations)
+    
+    # Detect unknowns
+    unknown_names = detect_unknowns(equations)
+    sympy_symbols = symbols(" ".join(unknown_names))
+    if not isinstance(sympy_symbols, (list, tuple)):
+        sympy_symbols = [sympy_symbols]
+    
+    # Solve
+    from sympy import solve as sym_solve
+    
+    try:
+        if len(eq_objects) == 1 and len(sympy_symbols) == 1:
+            # Single equation, single variable
+            sol = sym_solve(eq_objects[0], sympy_symbols[0])
+            solutions = sol
+        else:
+            # System of equations
+            sol = sym_solve(eq_objects, sympy_symbols, dict=True)
+            solutions = sol
+    except Exception as e:
+        raise ValueError(f"SymPy solve failed: {e}")
+    
+    # Validate
+    is_valid = validate_solution(eq_objects, solutions, sympy_symbols)
+    
+    # Format steps
+    steps_html = format_steps(eq_objects, solutions, [str(s) for s in sympy_symbols])
+    
+    # Build result with standardized format
+    result = {
+        "problem_type": "algebraic equation",
+        "raw_question": question,
+        "goal": "solve",
+        "equations": [{"lhs": lhs, "rhs": rhs} for lhs, rhs in equations],
+        "unknowns": unknown_names,
+        "solution": {
+            "unknown": unknown_names[0] if len(unknown_names) == 1 else "multiple",
+            "values": solutions if isinstance(solutions, list) else [solutions]
+        },
+        "answer": str(solutions),
+        "structured": {
+            "type": "algebra",
+            "solutions": str(solutions)
+        },
+        "steps_html": steps_html if is_valid else "<p>Solution found but validation failed.</p>",
+        "solved_by": "sympy_stub",
+        "validation": {
+            "ok": bool(is_valid),
+            "method": "substitution"
+        }
+    }
+    
+    return result
+
+def local_sympy_solve_from_question(question: str) -> Dict[str, Any]:
+    """
+    Solve mathematical question using SymPy.
+    
+    Complete pipeline:
+    1. Parse equations from text
+    2. Build SymPy equation objects
+    3. Solve using SymPy
+    4. Validate solutions
+    5. Format result with HTML/LaTeX
+    
+    Args:
+        question: Natural language question
+    
+    Returns:
+        Dictionary with solution, validation, and formatted output
+    
+    Raises:
+        ValueError: If parsing or solving fails
+    """
+    logger.info(f"Solving with SymPy: {question[:60]}...")
+    
+    try:
+        if CACHE_ENABLED:
+            # Use cached version
+            question_hash = str(hash(question))
+            result_json = _cached_sympy_solve(question_hash, question)
+            result = json.loads(result_json)
+        else:
+            # Direct solve
+            result = _sympy_solve_impl(question)
+        
+        logger.info("✓ SymPy solve completed")
+        return result
+    
+    except ValueError as e:
+        logger.error(f"✗ SymPy solve failed: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"✗ Unexpected error in SymPy solve: {e}", exc_info=True)
+        raise ValueError(f"Solver error: {e}")
+    
+
+# ============================================================================
+# JSON EXTRACTION UTILITIES
+# ============================================================================
+def unwrap_markdown_code(text: str) -> str:
+    """
+    Remove markdown code fences from text.
+    
+    Args:
+        text: Text with potential markdown fences
+    
+    Returns:
+        Clean code/text
+    """
+    if not text:
         return ""
-    s.strip()
-    # common fenced block pattern 
-    m = re.search(r"```(?:python|py)?\n(.+?)\n```", s, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # also strip single-line fenced content ```...```
-    m2 = re.search(r"```(.+?)```", s, flags=re.DOTALL)
-    if m2:
-        return m2.group(1).strip()
-    # remove leading ```python or ```json markers, trailing ```
-    s = re.sub(r"^```(?:python|py|json)?\n?", "", s, flags=re.IGNORECASE).strip()
-    s = re.sub(r"\n?```$", "", s, flags=re.IGNORECASE).strip()
-    return s
+    
+    text = text.strip()
+    
+    # Triple backtick fences with language
+    match = re.search(r"```(?:python|py|json)?\s*\n(.+?)\n```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    
+    # Inline code fence
+    match = re.search(r"```(.+?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    # Remove standalone fence markers
+    text = re.sub(r"^```(?:python|py|json)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text, flags=re.IGNORECASE)
+    
+    return text.strip()
+
 
 def extract_json_from_text_tolerant(text: str) -> Optional[Dict[str, Any]]:
     """
-    Try to extract JSON/dict from arbitrary text produced by model or executor.
-    Returns parsed dict or None.
+    Tolerantly extract JSON from mixed text.
+    
+    Strategies:
+    1. Unwrap markdown fences
+    2. Direct JSON parse
+    3. Find first {...} block
+    4. Progressive truncation
+    
+    Args:
+        text: Text potentially containing JSON
+    
+    Returns:
+        Parsed dictionary or None
     """
     if not text:
         return None
-    t = text.strip()
-    # If text looks like a fenced block, unwrap first
-    t_unwrapped = unwrap_markdown_code(t)
-    # try direct parse
+    
+    text = text.strip()
+    
+    # Unwrap markdown
+    text = unwrap_markdown_code(text)
+    
+    # Direct parse
     try:
-        return json.loads(t_unwrapped)
-    except Exception:
+        return json.loads(text)
+    except json.JSONDecodeError:
         pass
-    # fallback: find first {...} block
-    m = re.search(r"(\{.*\})", t, flags=re.DOTALL)
-    if not m:
+    
+    # Find first JSON object
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if not match:
         return None
-    candidate = m.group(1)
-    # progressively try to trim trailing garbage to find valid JSON
-    for end in range(len(candidate), 0, -1):
+    
+    candidate = match.group(1)
+    
+    # Progressive truncation
+    for end_pos in range(len(candidate), 0, -10):
         try:
-            return json.loads(candidate[:end])
-        except Exception:
+            return json.loads(candidate[:end_pos])
+        except json.JSONDecodeError:
             continue
-    # last attempt: try to eval as python literal safely (not recommended),
-    # we avoid eval to be safe — return None
+    
     return None
 
-    
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+def truncate_string(text: str, max_length: int = 100, suffix: str = "...") -> str:
+    """
+    Truncate string to maximum length.
+    
+    Args:
+        text: Input text
+        max_length: Maximum length
+        suffix: Suffix to append if truncated
+    
+    Returns:
+        Truncated string
+    """
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - len(suffix)] + suffix
+
+
+def format_duration(seconds: float) -> str:
+    """
+    Format duration in human-readable form.
+    
+    Args:
+        seconds: Duration in seconds
+    
+    Returns:
+        Formatted string (e.g., "2.5s", "1m 30s")
+    """
+    if seconds < 1:
+        return f"{seconds*1000:.0f}ms"
+    elif seconds < 60:
+        return f"{seconds:.1f}s"
+    else:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"

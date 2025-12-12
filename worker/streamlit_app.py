@@ -156,8 +156,62 @@ with st.sidebar:
 
 
 # ============================================================================
-# API HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # ============================================================================
+def extract_solution_display(result: Dict) -> Optional[Dict]:
+    """
+    Extract solution information from execution result.
+    
+    Returns:
+        Dict with 'variable', 'values', and 'display_text' or None
+    """
+    if not isinstance(result, dict):
+        return None
+    
+    # Check for solution key
+    solution = result.get("solution")
+
+    if solution and isinstance(solution, dict):
+        unkown = solution.get("unkown", "x")
+        values = solution.get("values", [])
+
+        if values:
+            if len(values) == 1:
+                display = f"{unkown} = {values[0]}"
+            else:
+                values_str = ", ".join(str(v) for v in values)
+                display = f"{unkown} = {values_str}"
+
+            return {
+                "variable": unkown,
+                "values": values,
+                "display_text": display
+            }
+
+    # Check for answer key
+    if "answer" in  result:
+        answer = result["answer"]
+        if isinstance(answer, (list, tuple)):
+            display = f"x = {', '.join(str(v) for v in answer)}"
+        else:
+            display = f"x = {answer}"
+
+            return {
+                "variable": "x",
+                "values": answer if isinstance(answer, list) else [answer],
+                "display_text": display
+            }
+    # Check for result key (another alternative)
+    if "result" in result and result["result"]:
+        res = result["result"]
+        if isinstance(res, dict) and "solution" in res:
+            return extract_solution_display(res)
+    
+    return None
+
+# ============================================================================
+# API HELPER FUNCTIONS
+# ============================================================================  
 def call_api_endpoint(
     endpoint: str,
     json_payload: Optional[Dict] = None,
@@ -332,7 +386,7 @@ with col_actions:
             st.warning("⚠️ No generated code available. Generate code first!")
         else:
             payload = {
-                "generated_code": code_text,  # ✅ FIXED: Send only the code string
+                "generated_code": code_text,  
                 "use_docker_executor": allow_docker_execution,
                 "timeout_seconds": execution_timeout
             }
@@ -440,31 +494,133 @@ execution_result = st.session_state.get("execution_result") or st.session_state.
 if execution_result:
     # Display metadata
     if isinstance(execution_result, dict):
+        # ============================================================
+        # SOLUTION DISPLAY (HERO SECTION)
+        # ============================================================
+        solution_info = extract_solution_display(execution_result)
+        if solution_info:
+            # Display solution promiinently with copy functionality
+            col_sol1, col_sol2 = st.columns([4, 1])
+        
+            with col_sol1:
+                st.markdown(f"""
+                <div style="
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    padding: 2rem;
+                    border-radius: 12px;
+                    margin: 1.5rem 0;
+                    box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+                ">
+                    <div style="
+                        color: white;
+                        font-size: 1.1rem;
+                        font-weight: 500;
+                        margin-bottom: 0.5rem;
+                        opacity: 0.9;
+                    ">
+                        ✅ Solution Found
+                    </div>
+                    <div style="
+                        color: white;
+                        font-size: 2.5rem;
+                        font-weight: 700;
+                        letter-spacing: 1px;
+                        font-family: 'Courier New', monospace;
+                    ">
+                        {solution_info['display_text']}
+                    </div>
+                    <div style="
+                        color: rgba(255,255,255,0.8);
+                        font-size: 0.95rem;
+                        margin-top: 1rem;
+                    ">
+                        Variable: {solution_info['variable']} • {len(solution_info['values'])} solution(s)
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        
+            with col_sol2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                # Show individual values for easy reference
+                st.metric("Solutions", len(solution_info['values']))
+                with st.expander("📋 Values"):
+                    for idx, val in enumerate(solution_info['values'], 1):
+                        st.code(f"{solution_info['variable']}_{idx} = {val}")
+        elif execution_result.get("status") != "success":
+            # Show error state
+            st.markdown("""
+            <div style="
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                padding: 2rem;
+                border-radius: 12px;
+                margin: 1.5rem 0;
+                box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+            ">
+                <div style="
+                    color: white;
+                    font-size: 1.1rem;
+                    font-weight: 500;
+                    margin-bottom: 0.5rem;
+                ">
+                    ❌ Execution Failed
+                </div>
+                <div style="
+                    color: white;
+                    font-size: 1.5rem;
+                    font-weight: 600;
+                ">
+                    See error details below
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Execution succeeded but no clear solution format
+            st.info("✅ Execution completed. Check full details below for results.")
+        # ============================================================
+        # EXECUTION METADATA
+        # ============================================================
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            solver = execution_result.get("requested_solver") or execution_result.get("solved_by", "N/A")
-            st.metric("Solver Used", solver)
+            problem_type = execution_result.get("problem_type", "Unknown")
+            st.metric("Problem Type", problem_type.title())
         
         with col2:
             exec_path = execution_result.get("execution_path", "N/A")
-            st.metric("Execution Path", exec_path)
+            # Prettier display
+            exec_display = exec_path.replace("_", " ").title()
+            st.metric("Execution Method", exec_display)
         
         with col3:
-            exit_code = execution_result.get("exit_code", execution_result.get("status", "N/A"))
-            st.metric("Exit Code", exit_code)
-        
-        # Display full result
+            status = execution_result.get("status", "unknown")
+            exit_code = execution_result.get("exit_code", status)
+            # Show success/failure with emoji
+            if status == "success" or exit_code == 0:
+                st.metric("Status", "✅ Success")
+            else:
+                st.metric("Status", f"❌ {exit_code}")
+
+        # ============================================================
+        # DETAILED RESULTS
+        # ============================================================ 
         with st.expander("📊 Full Execution Details", expanded=True):
             st.json(execution_result, expanded=False)
         
-        # Extract and display key results
-        if "stdout" in execution_result:
-            st.markdown("**Standard Output:**")
-            st.code(execution_result["stdout"], language="json")
-        
+        # Show stdout only if no solution was extracted (for debugging)
+        if not solution_info and "stdout" in execution_result:
+            stdout_content = execution_result.get("stdout", "").strip()
+            if stdout_content:
+                with st.expander("📄 Standard Output"):
+                    try:
+                        # Try to parse as JSON for pretty display
+                        stdout_json = json.loads(stdout_content)
+                        st.json(stdout_json)
+                    except:
+                        # Display as plain text if not JSON
+                        st.code(stdout_content)
+        # Show stderr if there are errors
         if "stderr" in execution_result and execution_result["stderr"]:
-            st.markdown("**Standard Error:**")
+            st.markdown("**⚠️ Warnings/Errors:**")
             st.error(execution_result["stderr"])
     else:
         st.text(str(execution_result))

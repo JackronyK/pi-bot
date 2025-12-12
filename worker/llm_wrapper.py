@@ -896,6 +896,129 @@ def generate_fallback_explanation(
         "confidence": 0.5
     }
 
+
+# ============================================================================
+# STUB GENERATION & EXECUTION (for tasks.py compatibility)
+# ============================================================================
+def generate_stub_code(question: str) -> Dict[str, Any]:
+    """
+    Generate safe stub code for testing/demonstration.
+    
+    This creates a simple template that uses SymPy to solve the problem
+    without making actual LLM calls.
+    
+    Args:
+        question: Question text
+    
+    Returns:
+        Dictionary with:
+        - code: Python code string
+        - mode: "stub"
+        - metadata: Additional info
+    """
+    logger.info("Generating stub code (safe template)")
+    
+    # Parse question to extract equation info
+    try:
+        equations = utils.extract_equations(question)
+        unknowns = utils.detect_unknowns(equations) if equations else ["x"]
+    except Exception:
+        equations = []
+        unknowns = ["x"]
+    
+    # Build stub code template
+    stub_code = f'''#!/usr/bin/env python3
+"""
+Auto-generated stub code for: {question[:60]}...
+This is a safe template that uses SymPy for solving.
+"""
+
+import json
+import sympy as sp
+
+def solve_problem():
+    """Solve the mathematical problem using SymPy."""
+    try:
+        # Define symbols
+        {", ".join(unknowns)} = sp.symbols("{' '.join(unknowns)}")
+        
+        # Define equation(s)
+        # TODO: Parse from question text
+        equations = []
+        
+        # Solve
+        solution = sp.solve(equations, [{", ".join(unknowns)}])
+        
+        # Format result
+        result = {{
+            "problem_type": "equation",
+            "unknowns": {unknowns},
+            "solution": {{"values": solution}},
+            "answer": str(solution),
+            "solved_by": "stub_code",
+            "execution_path": "stub"
+        }}
+        
+        return result
+    
+    except Exception as e:
+        return {{"error": str(e), "solved_by": "stub_code"}}
+
+if __name__ == "__main__":
+    result = solve_problem()
+    print(json.dumps(result, indent=2))
+'''
+    
+    return {
+        "code": stub_code,
+        "mode": "stub",
+        "metadata": {
+            "generator": "generate_stub_code",
+            "safe": True,
+            "equations": len(equations),
+            "unknowns": unknowns
+        }
+    }
+
+
+def run_llm_stub(code: str, question: str) -> Dict[str, Any]:
+    """
+    Run LLM stub code in a safe manner.
+    
+    Instead of executing the code, this falls back to using SymPy
+    to solve the problem directly. This ensures safety while maintaining
+    the same result format.
+    
+    Args:
+        code: Generated code (ignored for safety)
+        question: Original question
+    
+    Returns:
+        Dictionary matching the standard result format
+    """
+    logger.info("Running LLM stub (safe execution via SymPy)")
+    
+    try:
+        # Use utils to solve the problem safely
+        result = utils.local_sympy_solve_from_question(question)
+        
+        # Mark as stub execution
+        result["solved_by"] = "llm_stub"
+        result["execution_path"] = "stub_execution"
+        result.setdefault("metadata", {})["note"] = "Executed via safe SymPy fallback"
+        
+        logger.info("✓ Stub execution completed")
+        return result
+    
+    except Exception as e:
+        logger.error(f"Stub execution failed: {e}")
+        return {
+            "error": str(e),
+            "solved_by": "llm_stub",
+            "execution_path": "stub_execution_failed"
+        }
+
+
 # ============================================================================
 # CLI FOR TESTING
 # ============================================================================

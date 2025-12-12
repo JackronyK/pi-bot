@@ -245,7 +245,7 @@ def executor_run_docker_script(
             cpu_period=100000,
             network_mode=DOCKER_NETWORK_MODE,
             read_only=False,  # Need /tmp write access
-            remove=False,  # Manual cleanup for better logging
+            #remove=False,  # Manual cleanup for better logging
             auto_remove=False,
             labels={
                 "pibot.job_id": job_id,

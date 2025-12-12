@@ -579,19 +579,23 @@ if execution_result:
         # ============================================================
         # EXECUTION METADATA
         # ============================================================
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            problem_type = execution_result.get("problem_type", "Unknown")
-            st.metric("Problem Type", problem_type.title())
-        
+            soln = execution_result.get("solutions", "--")
+            st.metric("Soln", soln)
+
         with col2:
-            exec_path = execution_result.get("execution_path", "N/A")
-            # Prettier display
-            exec_display = exec_path.replace("_", " ").title()
-            st.metric("Execution Method", exec_display)
+            problem_type = execution_result.get("problem_type", "Unknown")
+            st.metric("Problem Type", problem_type)
         
         with col3:
+            exec_path = execution_result.get("execution_path", "N/A")
+            # Prettier display
+            exec_display = exec_path.replace("_", " ")
+            st.metric("Execution Method", exec_display)
+        
+        with col4:
             status = execution_result.get("status", "unknown")
             exit_code = execution_result.get("exit_code", status)
             # Show success/failure with emoji

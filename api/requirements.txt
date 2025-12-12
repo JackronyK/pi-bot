@@ -10,6 +10,7 @@ pytest
 python-dotenv
 sympy
 google-genai
+docker>=6.1.0
 
 # OCR / PDF / imaging
 pdf2image==1.16.0        # uses poppler pdftoppm (installed as poppler-utils)
